@@ -39,6 +39,6 @@ Proxy sau khi tạo sẽ có dạng: `IP:1080:japan:japn`
 3. Chạy:
 
 ```bash
-wget -O azure_proxy_bootstrap.sh https://raw.githubusercontent.com/<your-username>/azure-proxy-tool/main/azure_proxy_bootstrap.sh
+wget -O azure_proxy_bootstrap.sh https://raw.githubusercontent.com/Solsticen/azure-proxy-toole/refs/heads/main/azure_proxy_bootstrap.sh
 chmod +x azure_proxy_bootstrap.sh
 bash azure_proxy_bootstrap.sh
