@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================================================
-# Azure Cloud Shell Bootstrap - SOCKS5 Proxy Tool
-# Region: japaneast
-# =========================================================
-
 TOOL_DIR="$HOME/azure-proxy-tool"
 mkdir -p "$TOOL_DIR"
 cd "$TOOL_DIR"
@@ -69,7 +64,7 @@ echo "[OK] Resource Provider registration completed."
 EOF
 
 # =========================================================
-# 02_make_cloud_init.sh
+# 02_make_cloud_init.sh - FIXED: use write_files instead of heredoc
 # =========================================================
 cat > 02_make_cloud_init.sh <<'EOF'
 #!/usr/bin/env bash
@@ -87,51 +82,54 @@ packages:
   - git
   - build-essential
   - ufw
+
+write_files:
+  - path: /etc/3proxy/3proxy.cfg
+    content: |
+      daemon
+      nscache 65536
+      timeouts 1 5 30 60 180 1800 15 60
+      users japan:CL:japn
+      auth strong
+      allow japan
+      proxy -p1080
+      flush
+
+  - path: /etc/systemd/system/3proxy.service
+    content: |
+      [Unit]
+      Description=3proxy SOCKS5 Proxy
+      After=network.target
+
+      [Service]
+      Type=forking
+      ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+      Restart=always
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+
 runcmd:
   - |
     set -e
     exec > /root/install_3proxy.log 2>&1
     echo "=== Installing 3proxy ==="
-    THREEPROXY_BIN="$(command -v 3proxy || true)"
-    if [ -z "$THREEPROXY_BIN" ]; then
+    if ! command -v 3proxy; then
       apt-get install -y 3proxy || true
-      THREEPROXY_BIN="$(command -v 3proxy || true)"
     fi
-    if [ -z "$THREEPROXY_BIN" ]; then
+    if ! command -v 3proxy; then
       cd /opt
       rm -rf 3proxy
       git clone https://github.com/3proxy/3proxy.git
       cd /opt/3proxy
       make -f Makefile.Linux
       install -m 755 /opt/3proxy/bin/3proxy /usr/local/bin/3proxy
-      THREEPROXY_BIN="/usr/local/bin/3proxy"
     fi
-    mkdir -p /etc/3proxy
-    cat > /etc/3proxy/3proxy.cfg <<CFG
-    daemon
-    nscache 65536
-    timeouts 1 5 30 60 180 1800 15 60
-    users japan:CL:japn
-    auth strong
-    allow japan
-    proxy -p1080
-    flush
-CFG
-    cat > /etc/systemd/system/3proxy.service <<SVC
-    [Unit]
-    Description=3proxy SOCKS5 Proxy
-    After=network.target
-    [Service]
-    Type=forking
-    ExecStart=$THREEPROXY_BIN /etc/3proxy/3proxy.cfg
-    Restart=always
-    RestartSec=10
-    [Install]
-    WantedBy=multi-user.target
-SVC
     systemctl daemon-reload
     systemctl enable 3proxy
-    systemctl start 3proxy
+    systemctl restart 3proxy
+    ufw --force enable
     ufw allow 1080/tcp
     echo "=== 3proxy installation complete ==="
 CLOUDINIT
@@ -140,7 +138,7 @@ echo "[OK] cloud-init generated."
 EOF
 
 # =========================================================
-# 03_create_proxies.sh
+# 03_create_proxies.sh - with auto-fix on failure
 # =========================================================
 cat > 03_create_proxies.sh <<'EOF'
 #!/usr/bin/env bash
@@ -219,7 +217,7 @@ open_nsg_port() {
 test_proxy() {
     local ip="$1"
     echo "[+] Testing SOCKS5 proxy: ${ip}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}"
-    for i in {1..20}; do
+    for i in {1..30}; do
         result="$(curl -sS \
             --connect-timeout 10 \
             --max-time 20 \
@@ -229,12 +227,10 @@ test_proxy() {
             echo "[OK] Proxy live: ${ip}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}"
             return 0
         fi
-        echo "    Waiting for cloud-init/3proxy... attempt $i/20"
-        sleep 15
+        echo "    Waiting for cloud-init/3proxy... attempt $i/30"
+        sleep 10
     done
-    echo "[!] Proxy test failed for now."
-    echo "    Check VM install log:"
-    echo "    az vm run-command invoke -g $RESOURCE_GROUP -n <vm_name> --command-id RunShellScript --scripts 'cat /root/install_3proxy.log; systemctl status 3proxy --no-pager; ss -lntp | grep 1080'"
+    echo "[!] Proxy test failed after 30 attempts."
     return 1
 }
 
@@ -293,7 +289,19 @@ create_one_proxy() {
     echo "$proxy_line"
     echo
 
-    test_proxy "$ip" || true
+    if test_proxy "$ip"; then
+        return 0
+    else
+        echo "[!] Proxy test failed. Attempting auto-fix..."
+        bash ./05_fix_one_proxy.sh "$vm_name" || true
+        echo "[+] Retesting after fix..."
+        if test_proxy "$ip"; then
+            echo "[OK] Proxy works after fix."
+        else
+            echo "[ERROR] Proxy still not working after fix. Please debug manually."
+            echo "    bash 08_debug_one_proxy.sh $vm_name"
+        fi
+    fi
 }
 
 echo "[+] Start creating $QUANTITY proxy/proxies..."
@@ -363,23 +371,21 @@ cat > /tmp/fix_3proxy_vm.sh <<'FIX'
 set -e
 exec > /root/fix_3proxy.log 2>&1
 echo "=== Fixing 3proxy ==="
-THREEPROXY_BIN="$(command -v 3proxy || true)"
-if [ -z "$THREEPROXY_BIN" ]; then
+if ! command -v 3proxy; then
     apt-get update
     apt-get install -y 3proxy || true
-    THREEPROXY_BIN="$(command -v 3proxy || true)"
 fi
-if [ -z "$THREEPROXY_BIN" ]; then
+if ! command -v 3proxy; then
     cd /opt
     rm -rf 3proxy
     git clone https://github.com/3proxy/3proxy.git
     cd /opt/3proxy
     make -f Makefile.Linux
     install -m 755 /opt/3proxy/bin/3proxy /usr/local/bin/3proxy
-    THREEPROXY_BIN="/usr/local/bin/3proxy"
 fi
+
 mkdir -p /etc/3proxy
-cat > /etc/3proxy/3proxy.cfg <<CFG
+cat > /etc/3proxy/3proxy.cfg <<'EOC'
 daemon
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
@@ -388,22 +394,27 @@ auth strong
 allow japan
 proxy -p1080
 flush
-CFG
-cat > /etc/systemd/system/3proxy.service <<SVC
+EOC
+
+cat > /etc/systemd/system/3proxy.service <<'EOS'
 [Unit]
 Description=3proxy SOCKS5 Proxy
 After=network.target
+
 [Service]
 Type=forking
-ExecStart=$THREEPROXY_BIN /etc/3proxy/3proxy.cfg
+ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
 Restart=always
 RestartSec=10
+
 [Install]
 WantedBy=multi-user.target
-SVC
+EOS
+
 systemctl daemon-reload
 systemctl enable 3proxy
 systemctl restart 3proxy
+ufw --force enable
 ufw allow 1080/tcp
 echo "=== Fix complete ==="
 FIX
