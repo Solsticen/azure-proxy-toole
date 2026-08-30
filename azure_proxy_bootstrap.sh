@@ -31,10 +31,6 @@ read_prompt() {
   eval "$out_var=\"\$user_input\""
 }
 
-clear_screen() {
-  clear 2>/dev/null || true
-}
-
 echo "=========================================================="
 echo "    Azure SOCKS5 Proxy Deployment Tool (Cloud Shell)      "
 echo "=========================================================="
@@ -185,6 +181,72 @@ source ./00_config.sh
 
 echo "[+] Generating cloud-init file: $CLOUD_INIT_FILE"
 
+TMP_SCRIPT="$(mktemp)"
+cat > "$TMP_SCRIPT" <<SCRIPT_EOF
+#!/usr/bin/env bash
+set -eux
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y curl ca-certificates ufw git build-essential make gcc libssl-dev
+
+systemctl stop 3proxy || true
+pkill 3proxy || true
+
+cd /opt
+rm -rf 3proxy
+git clone https://github.com/3proxy/3proxy.git
+cd /opt/3proxy
+make -f Makefile.Linux
+install -m 755 /opt/3proxy/bin/3proxy /usr/local/bin/3proxy
+
+mkdir -p /etc/3proxy
+
+cat > /etc/3proxy/3proxy.cfg << 'CFG'
+daemon
+maxconn 1000
+nscache 65536
+timeouts 1 5 30 60 180 1800 15 60
+auth strong
+users ${PROXY_USER}:CL:${PROXY_PASS}
+allow ${PROXY_USER}
+socks -p${PROXY_PORT} -i0.0.0.0
+CFG
+
+cat > /etc/systemd/system/3proxy.service << 'SVC'
+[Unit]
+Description=3proxy SOCKS5 Proxy Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+ufw allow 22/tcp || true
+ufw allow ${PROXY_PORT}/tcp || true
+ufw --force enable || true
+iptables -I INPUT -p tcp --dport ${PROXY_PORT} -j ACCEPT || true
+
+systemctl daemon-reload
+systemctl enable 3proxy
+systemctl restart 3proxy
+
+sleep 2
+systemctl status 3proxy --no-pager || true
+ss -lntp | grep ":${PROXY_PORT}" || true
+SCRIPT_EOF
+
+FINAL_B64=$(base64 -w 0 "$TMP_SCRIPT" 2>/dev/null || base64 "$TMP_SCRIPT" | tr -d '\r\n')
+rm -f "$TMP_SCRIPT"
+
 cat > "$CLOUD_INIT_FILE" <<CLOUDINIT
 #cloud-config
 package_update: true
@@ -194,82 +256,8 @@ write_files:
   - path: /root/install_3proxy.sh
     owner: root:root
     permissions: '0755'
-    content: |
-      #!/usr/bin/env bash
-      set -eux
-
-      PROXY_USER="${PROXY_USER}"
-      PROXY_PASS="${PROXY_PASS}"
-      PROXY_PORT="${PROXY_PORT}"
-
-      export DEBIAN_FRONTEND=noninteractive
-
-      apt-get update -y
-      apt-get install -y curl ca-certificates ufw git build-essential make gcc libssl-dev
-
-      systemctl stop 3proxy || true
-      pkill 3proxy || true
-
-      THREEPROXY_BIN=""
-
-      if apt-cache show 3proxy >/dev/null 2>&1; then
-        apt-get install -y 3proxy || true
-        THREEPROXY_BIN="\$(command -v 3proxy || true)"
-      fi
-
-      if [ -z "\$THREEPROXY_BIN" ]; then
-        cd /opt
-        rm -rf 3proxy
-        git clone https://github.com/3proxy/3proxy.git
-        cd /opt/3proxy
-        make -f Makefile.Linux
-        install -m 755 /opt/3proxy/bin/3proxy /usr/local/bin/3proxy
-        THREEPROXY_BIN="/usr/local/bin/3proxy"
-      fi
-
-      mkdir -p /etc/3proxy
-
-      cat > /etc/3proxy/3proxy.cfg <<PROXYCONF
-      daemon
-      maxconn 1000
-      nscache 65536
-      timeouts 1 5 30 60 180 1800 15 60
-      auth strong
-      users \${PROXY_USER}:CL:\${PROXY_PASS}
-      allow \${PROXY_USER}
-      socks -p\${PROXY_PORT} -i0.0.0.0
-      PROXYCONF
-
-      cat > /etc/systemd/system/3proxy.service <<SERVICECONF
-      [Unit]
-      Description=3proxy SOCKS5 Proxy Server
-      After=network-online.target
-      Wants=network-online.target
-
-      [Service]
-      Type=forking
-      ExecStart=\${THREEPROXY_BIN} /etc/3proxy/3proxy.cfg
-      Restart=always
-      RestartSec=5
-      LimitNOFILE=65536
-
-      [Install]
-      WantedBy=multi-user.target
-      SERVICECONF
-
-      ufw allow 22/tcp || true
-      ufw allow \${PROXY_PORT}/tcp || true
-      ufw --force enable || true
-      iptables -I INPUT -p tcp --dport \${PROXY_PORT} -j ACCEPT || true
-
-      systemctl daemon-reload
-      systemctl enable 3proxy
-      systemctl restart 3proxy
-
-      sleep 2
-
-      systemctl status 3proxy --no-pager || true
-      ss -lntp | grep ":\${PROXY_PORT}" || true
+    encoding: b64
+    content: ${FINAL_B64}
 
 runcmd:
   - bash /root/install_3proxy.sh > /root/install_3proxy.log 2>&1
@@ -527,15 +515,12 @@ if [[ -z "$VM_NAME" ]]; then
   exit 1
 fi
 
-cat > /tmp/fix_3proxy_vm.sh <<FIXSCRIPT
+FIX_TMP="$(mktemp)"
+cat > "$FIX_TMP" <<FIXSCRIPT
+#!/usr/bin/env bash
 set -eux
 
-PROXY_USER="${PROXY_USER}"
-PROXY_PASS="${PROXY_PASS}"
-PROXY_PORT="${PROXY_PORT}"
-
 export DEBIAN_FRONTEND=noninteractive
-
 apt-get update -y
 apt-get install -y curl ca-certificates ufw git build-essential make gcc libssl-dev
 
@@ -551,18 +536,18 @@ install -m 755 /opt/3proxy/bin/3proxy /usr/local/bin/3proxy
 
 mkdir -p /etc/3proxy
 
-cat > /etc/3proxy/3proxy.cfg <<PROXYCONF
+cat > /etc/3proxy/3proxy.cfg << 'CFG'
 daemon
 maxconn 1000
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 auth strong
-users \${PROXY_USER}:CL:\${PROXY_PASS}
-allow \${PROXY_USER}
-socks -p\${PROXY_PORT} -i0.0.0.0
-PROXYCONF
+users ${PROXY_USER}:CL:${PROXY_PASS}
+allow ${PROXY_USER}
+socks -p${PROXY_PORT} -i0.0.0.0
+CFG
 
-cat > /etc/systemd/system/3proxy.service <<SERVICECONF
+cat > /etc/systemd/system/3proxy.service << 'SVC'
 [Unit]
 Description=3proxy SOCKS5 Proxy Server
 After=network-online.target
@@ -577,21 +562,20 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-SERVICECONF
+SVC
 
 ufw allow 22/tcp || true
-ufw allow \${PROXY_PORT}/tcp || true
+ufw allow ${PROXY_PORT}/tcp || true
 ufw --force enable || true
-iptables -I INPUT -p tcp --dport \${PROXY_PORT} -j ACCEPT || true
+iptables -I INPUT -p tcp --dport ${PROXY_PORT} -j ACCEPT || true
 
 systemctl daemon-reload
 systemctl enable 3proxy
 systemctl restart 3proxy
 
 sleep 2
-
 systemctl status 3proxy --no-pager || true
-ss -lntp | grep ":\${PROXY_PORT}" || true
+ss -lntp | grep ":${PROXY_PORT}" || true
 FIXSCRIPT
 
 echo "[+] Fixing 3proxy on VM: $VM_NAME"
@@ -600,8 +584,9 @@ az vm run-command invoke \
   -g "$RESOURCE_GROUP" \
   -n "$VM_NAME" \
   --command-id RunShellScript \
-  --scripts "$(cat /tmp/fix_3proxy_vm.sh)"
+  --scripts "@$FIX_TMP"
 
+rm -f "$FIX_TMP"
 echo "[OK] Fix command completed."
 EOF
 
@@ -733,11 +718,9 @@ if [[ -z "$VM_NAME" ]]; then
   exit 1
 fi
 
-az vm run-command invoke \
-  -g "$RESOURCE_GROUP" \
-  -n "$VM_NAME" \
-  --command-id RunShellScript \
-  --scripts '
+DEBUG_TMP="$(mktemp)"
+cat > "$DEBUG_TMP" <<'DEBUGSCRIPT'
+#!/usr/bin/env bash
 echo "===== cloud-init status ====="
 cloud-init status --long || true
 
@@ -755,7 +738,15 @@ ufw status verbose || true
 
 echo "===== config ====="
 cat /etc/3proxy/3proxy.cfg || true
-'
+DEBUGSCRIPT
+
+az vm run-command invoke \
+  -g "$RESOURCE_GROUP" \
+  -n "$VM_NAME" \
+  --command-id RunShellScript \
+  --scripts "@$DEBUG_TMP"
+
+rm -f "$DEBUG_TMP"
 EOF
 
 # =========================================================
